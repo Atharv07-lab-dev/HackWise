@@ -60,7 +60,7 @@ class Config:
     
     # Processing
     process_every_n_frames: int = 3  # Balance between speed and accuracy
-    max_videos: int = 5
+    max_videos: int = 100
     
     # Safety thresholds
     critical_distance: float = 1.5  # meters - immediate danger

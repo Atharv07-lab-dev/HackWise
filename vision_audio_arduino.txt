@@ -1,0 +1,484 @@
+/*
+ * Vision-to-Spatial-Audio System for Visually Impaired
+ * 
+ * Hardware Requirements:
+ * - ESP32-CAM (or ESP32 with OV2640 camera module)
+ * - I2S Audio DAC (e.g., MAX98357A) or DFPlayer Mini MP3 module
+ * - Speaker or headphones
+ * - WiFi connectivity for model endpoint access
+ * 
+ * Pin Configuration (ESP32-CAM):
+ * - Camera: Default ESP32-CAM pins
+ * - I2S Audio: GPIO 25 (BCLK), GPIO 26 (LRC), GPIO 22 (DIN)
+ * 
+ * Features:
+ * - Real-time image/video capture
+ * - HTTP POST to model endpoint
+ * - Spatial audio generation based on object position
+ * - Temporal consistency tracking
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "esp_camera.h"
+#include "driver/i2s.h"
+#include "Arduino.h"
+#include "ArduinoJson.h"
+#include "base64.h"
+
+// WiFi credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Model endpoint configuration
+const char* modelEndpoint = "YOUR_MODEL_ENDPOINT_URL";
+const char* apiKey = "YOUR_API_KEY"; // If required
+
+// Camera configuration for ESP32-CAM (AI-Thinker model)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// I2S configuration for audio output
+#define I2S_NUM           I2S_NUM_0
+#define I2S_BCK_PIN       25
+#define I2S_WS_PIN        26
+#define I2S_DATA_PIN      22
+#define SAMPLE_RATE       16000
+
+// System settings
+#define CAPTURE_INTERVAL  2000  // ms between captures (video mode)
+#define IMAGE_QUALITY     10    // 0-63, lower = better quality
+#define FRAME_SIZE        FRAMESIZE_VGA // 640x480
+
+// Temporal consistency
+struct DetectedObject {
+  String name;
+  float x, y;  // Normalized position (0-1)
+  unsigned long lastSeen;
+  bool announced;
+};
+
+#define MAX_TRACKED_OBJECTS 10
+DetectedObject trackedObjects[MAX_TRACKED_OBJECTS];
+int objectCount = 0;
+
+// Operating mode
+enum Mode { IMAGE_MODE, VIDEO_MODE };
+Mode currentMode = VIDEO_MODE;
+
+// Audio synthesis parameters
+struct SpatialAudio {
+  float panPosition;  // -1 (left) to 1 (right)
+  float distance;     // 0 (close) to 1 (far)
+  String objectName;
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nVision-to-Spatial-Audio System Starting...");
+  
+  // Initialize WiFi
+  initWiFi();
+  
+  // Initialize camera
+  initCamera();
+  
+  // Initialize I2S audio
+  initI2S();
+  
+  // Initialize object tracking
+  initObjectTracking();
+  
+  Serial.println("System Ready!");
+  playStartupTone();
+}
+
+void loop() {
+  if (currentMode == VIDEO_MODE) {
+    // Continuous capture mode
+    processFrame();
+    delay(CAPTURE_INTERVAL);
+  } else {
+    // Single image mode (trigger via Serial or button)
+    if (Serial.available() > 0) {
+      char cmd = Serial.read();
+      if (cmd == 'c' || cmd == 'C') {
+        processFrame();
+      } else if (cmd == 'm' || cmd == 'M') {
+        toggleMode();
+      }
+    }
+  }
+  
+  // Clean up old tracked objects
+  cleanupTrackedObjects();
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi Connection Failed!");
+  }
+}
+
+void initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAME_SIZE;
+  config.jpeg_quality = IMAGE_QUALITY;
+  config.fb_count = 2;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return;
+  }
+  
+  // Adjust sensor settings for better indoor detection
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s, 0);     // -2 to 2
+  s->set_contrast(s, 0);       // -2 to 2
+  s->set_saturation(s, 0);     // -2 to 2
+  s->set_whitebal(s, 1);       // Auto white balance
+  s->set_awb_gain(s, 1);       // Auto gain
+  s->set_wb_mode(s, 0);        // Auto white balance mode
+  
+  Serial.println("Camera initialized");
+}
+
+void initI2S() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+  
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_BCK_PIN,
+    .ws_io_num = I2S_WS_PIN,
+    .data_out_num = I2S_DATA_PIN,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+  
+  i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM, &pin_config);
+  i2s_set_clk(I2S_NUM, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+  
+  Serial.println("I2S Audio initialized");
+}
+
+void initObjectTracking() {
+  for (int i = 0; i < MAX_TRACKED_OBJECTS; i++) {
+    trackedObjects[i].name = "";
+    trackedObjects[i].lastSeen = 0;
+    trackedObjects[i].announced = false;
+  }
+  objectCount = 0;
+}
+
+void processFrame() {
+  Serial.println("\n--- Capturing Frame ---");
+  
+  // Capture image
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    playErrorTone();
+    return;
+  }
+  
+  Serial.printf("Image captured: %d bytes\n", fb->len);
+  
+  // Send to model endpoint
+  String response = sendToModel(fb->buf, fb->len);
+  
+  // Release frame buffer
+  esp_camera_fb_return(fb);
+  
+  if (response.length() > 0) {
+    // Parse response and generate audio
+    processModelResponse(response);
+  } else {
+    Serial.println("No response from model");
+    playErrorTone();
+  }
+}
+
+String sendToModel(uint8_t* imageData, size_t imageLen) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected");
+    return "";
+  }
+  
+  HTTPClient http;
+  http.begin(modelEndpoint);
+  http.addHeader("Content-Type", "application/json");
+  if (strlen(apiKey) > 0) {
+    http.addHeader("Authorization", String("Bearer ") + apiKey);
+  }
+  
+  // Encode image to base64
+  String base64Image = base64::encode(imageData, imageLen);
+  
+  // Create JSON payload
+  StaticJsonDocument<512> doc;
+  doc["image"] = base64Image;
+  doc["task"] = "object_detection";
+  doc["format"] = "spatial";
+  
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  
+  Serial.println("Sending request to model...");
+  int httpCode = http.POST(jsonPayload);
+  
+  String response = "";
+  if (httpCode == 200) {
+    response = http.getString();
+    Serial.println("Model response received");
+  } else {
+    Serial.printf("HTTP Error: %d\n", httpCode);
+  }
+  
+  http.end();
+  return response;
+}
+
+void processModelResponse(String response) {
+  StaticJsonDocument<2048> doc;
+  DeserializationError error = deserializeJson(doc, response);
+  
+  if (error) {
+    Serial.print("JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  // Expected format: {"objects": [{"name": "chair", "x": 0.3, "y": 0.5, "confidence": 0.9}]}
+  JsonArray objects = doc["objects"];
+  
+  if (objects.size() == 0) {
+    if (objectCount == 0) {
+      speakText("Clear path");
+    }
+    return;
+  }
+  
+  Serial.printf("Detected %d objects\n", objects.size());
+  
+  // Process each detected object
+  for (JsonObject obj : objects) {
+    String name = obj["name"];
+    float x = obj["x"]; // 0 (left) to 1 (right)
+    float y = obj["y"]; // 0 (top) to 1 (bottom)
+    float confidence = obj["confidence"];
+    
+    if (confidence < 0.5) continue; // Skip low confidence detections
+    
+    // Check temporal consistency
+    bool isNew = updateTrackedObject(name, x, y);
+    
+    if (isNew) {
+      // Generate spatial audio for new object
+      SpatialAudio audio;
+      audio.objectName = name;
+      audio.panPosition = (x - 0.5) * 2; // Convert to -1 to 1
+      audio.distance = y; // Use y position as rough distance estimate
+      
+      playSpatialAudio(audio);
+    }
+  }
+}
+
+bool updateTrackedObject(String name, float x, float y) {
+  unsigned long now = millis();
+  
+  // Check if object already tracked
+  for (int i = 0; i < objectCount; i++) {
+    if (trackedObjects[i].name == name) {
+      float dx = abs(trackedObjects[i].x - x);
+      float dy = abs(trackedObjects[i].y - y);
+      
+      // If position is similar, update timestamp
+      if (dx < 0.15 && dy < 0.15) {
+        trackedObjects[i].lastSeen = now;
+        trackedObjects[i].x = x;
+        trackedObjects[i].y = y;
+        return false; // Not new
+      }
+    }
+  }
+  
+  // Add new object
+  if (objectCount < MAX_TRACKED_OBJECTS) {
+    trackedObjects[objectCount].name = name;
+    trackedObjects[objectCount].x = x;
+    trackedObjects[objectCount].y = y;
+    trackedObjects[objectCount].lastSeen = now;
+    trackedObjects[objectCount].announced = false;
+    objectCount++;
+    return true;
+  }
+  
+  return false;
+}
+
+void cleanupTrackedObjects() {
+  unsigned long now = millis();
+  const unsigned long timeout = 5000; // 5 seconds
+  
+  for (int i = 0; i < objectCount; i++) {
+    if (now - trackedObjects[i].lastSeen > timeout) {
+      // Remove object by shifting array
+      for (int j = i; j < objectCount - 1; j++) {
+        trackedObjects[j] = trackedObjects[j + 1];
+      }
+      objectCount--;
+      i--;
+    }
+  }
+}
+
+void playSpatialAudio(SpatialAudio audio) {
+  Serial.printf("Spatial Audio: %s at pan=%.2f, dist=%.2f\n", 
+                audio.objectName.c_str(), audio.panPosition, audio.distance);
+  
+  // Generate spatial audio description
+  String direction = "";
+  if (audio.panPosition < -0.3) direction = "left ";
+  else if (audio.panPosition > 0.3) direction = "right ";
+  
+  String distance = "";
+  if (audio.distance < 0.4) distance = "close ";
+  else if (audio.distance > 0.7) distance = "far ";
+  
+  String announcement = direction + distance + audio.objectName;
+  speakText(announcement);
+  
+  // Play directional tone
+  playDirectionalTone(audio.panPosition, audio.distance);
+}
+
+void speakText(String text) {
+  // For actual TTS, integrate with a TTS library or external module
+  // This is a placeholder that prints to serial
+  Serial.print("SPEAK: ");
+  Serial.println(text);
+  
+  // In production, you would:
+  // 1. Use DFPlayer Mini with pre-recorded audio files
+  // 2. Send to external TTS service and play returned audio
+  // 3. Use offline TTS library if available for ESP32
+}
+
+void playDirectionalTone(float pan, float distance) {
+  const int duration = 200; // ms
+  const int frequency = 800 - (int)(distance * 300); // Higher pitch = closer
+  
+  // Calculate stereo volumes based on pan (-1 to 1)
+  float leftVolume = (1.0 - pan) / 2.0;
+  float rightVolume = (1.0 + pan) / 2.0;
+  
+  int numSamples = (SAMPLE_RATE * duration) / 1000;
+  int16_t samples[2]; // Stereo
+  size_t bytes_written;
+  
+  for (int i = 0; i < numSamples; i++) {
+    float t = (float)i / SAMPLE_RATE;
+    int16_t value = (int16_t)(sin(2 * PI * frequency * t) * 8000);
+    
+    samples[0] = (int16_t)(value * leftVolume);  // Left channel
+    samples[1] = (int16_t)(value * rightVolume); // Right channel
+    
+    i2s_write(I2S_NUM, samples, sizeof(samples), &bytes_written, portMAX_DELAY);
+  }
+}
+
+void playStartupTone() {
+  const int frequencies[] = {523, 659, 784}; // C, E, G
+  for (int f : frequencies) {
+    playTone(f, 150);
+    delay(50);
+  }
+}
+
+void playErrorTone() {
+  playTone(200, 500);
+}
+
+void playTone(int frequency, int duration) {
+  int numSamples = (SAMPLE_RATE * duration) / 1000;
+  int16_t samples[2];
+  size_t bytes_written;
+  
+  for (int i = 0; i < numSamples; i++) {
+    float t = (float)i / SAMPLE_RATE;
+    int16_t value = (int16_t)(sin(2 * PI * frequency * t) * 8000);
+    samples[0] = value;
+    samples[1] = value;
+    i2s_write(I2S_NUM, samples, sizeof(samples), &bytes_written, portMAX_DELAY);
+  }
+}
+
+void toggleMode() {
+  currentMode = (currentMode == IMAGE_MODE) ? VIDEO_MODE : IMAGE_MODE;
+  Serial.print("Mode changed to: ");
+  Serial.println(currentMode == IMAGE_MODE ? "IMAGE" : "VIDEO");
+  playTone(1000, 100);
+}
